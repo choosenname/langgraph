@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "codex-otc-review"
 version = "0.1.0"
 description = "Manual multi-role review scenario powered by Codex App Server"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "langgraph",
 ]

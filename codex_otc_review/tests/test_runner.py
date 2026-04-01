@@ -144,3 +144,26 @@ def test_runner_stops_after_approval(tmp_path: Path) -> None:
     assert result.findings[0].id == "F-003"
     assert len(result.transcript) == 4
     assert len(node.calls) == 4
+
+
+def test_runner_writes_expected_artifact_names(tmp_path: Path) -> None:
+    node = _FakeNode(
+        responses=[
+            "Initial orchestration scope",
+            json.dumps({"summary": "Only pass", "findings": []}),
+            json.dumps(
+                {
+                    "approved": True,
+                    "needs_more_research": False,
+                    "blocking_gaps": [],
+                }
+            ),
+            "# Final Report\n\nNo findings.\n",
+        ]
+    )
+
+    ScenarioRunner(config=_config(tmp_path), node=node).run()
+
+    assert (tmp_path / "report.md").exists()
+    assert (tmp_path / "findings.json").exists()
+    assert (tmp_path / "transcript.jsonl").exists()

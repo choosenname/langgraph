@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.prebuilt import CodexAppServerNode
@@ -81,7 +82,9 @@ class ScenarioRunner:
                 break
             reviewer_feedback = "; ".join(review["blocking_gaps"]) or reviewer_output
         else:  # pragma: no cover - defensive fallback
-            reviewer_feedback = reviewer_feedback or "Max loops reached without approval."
+            reviewer_feedback = (
+                reviewer_feedback or "Max loops reached without approval."
+            )
 
         final_prompt = (
             "Produce the final markdown report for this scenario.\n"
@@ -90,7 +93,9 @@ class ScenarioRunner:
         )
         report = self._turn(
             role="orchestrator",
-            loop_index=len([entry for entry in transcript if entry["role"] == "reviewer"]),
+            loop_index=len(
+                [entry for entry in transcript if entry["role"] == "reviewer"]
+            ),
             prompt=final_prompt,
             transcript=transcript,
         )
@@ -166,3 +171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runner = ScenarioRunner(config=config, node=build_node(config))
     runner.run()
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
