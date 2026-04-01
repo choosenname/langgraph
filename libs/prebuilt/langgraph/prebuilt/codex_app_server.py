@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
 import threading
-from typing import Any, Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, convert_to_messages
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    convert_to_messages,
+)
 from langchain_core.runnables.config import RunnableConfig
-
 from langgraph._internal._runnable import RunnableCallable
 
 
@@ -20,7 +25,7 @@ class CodexAppServerError(Exception):
 class CodexAppServerNode(RunnableCallable):
     """RunnableCallable shell for future Codex app server integration."""
 
-    _transport_factory: Callable[["CodexAppServerNode"], Any] | None = None
+    _transport_factory: Callable[[CodexAppServerNode], Any] | None = None
 
     def __init__(
         self,
@@ -46,7 +51,7 @@ class CodexAppServerNode(RunnableCallable):
         super().__init__(self._func, self._afunc, name="codex_app_server", trace=False)
 
     @staticmethod
-    def _default_transport_factory(_: "CodexAppServerNode") -> Any:
+    def _default_transport_factory(_: CodexAppServerNode) -> Any:
         raise CodexAppServerError("Codex app server transport is not implemented yet.")
 
     def _ensure_transport(self) -> Any:
@@ -55,7 +60,9 @@ class CodexAppServerNode(RunnableCallable):
             transport = factory(self)
             start = getattr(transport, "start", None)
             if start is None:
-                raise CodexAppServerError("Codex app server transport is missing start().")
+                raise CodexAppServerError(
+                    "Codex app server transport is missing start()."
+                )
             start()
             self._transport = transport
         return self._transport

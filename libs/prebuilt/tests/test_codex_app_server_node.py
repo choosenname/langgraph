@@ -527,7 +527,16 @@ def test_codex_app_server_node_raises_on_eof_before_completion(
     with pytest.raises(prebuilt.CodexAppServerError, match="EOF"):
         node.invoke({"messages": [HumanMessage(content="hello")]})
 
-    assert transport.requests[0] == {"type": "initialize", "command": None, "cwd": None, "model": None, "approval_policy": None, "sandbox_policy": None, "client_info": None, "messages_key": "messages"}
+    assert transport.requests[0] == {
+        "type": "initialize",
+        "command": None,
+        "cwd": None,
+        "model": None,
+        "approval_policy": None,
+        "sandbox_policy": None,
+        "client_info": None,
+        "messages_key": "messages",
+    }
     assert transport.requests[1] == {"type": "thread/start"}
     assert transport.requests[2] == {
         "type": "turn/start",
