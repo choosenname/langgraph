@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-otc-review"
+version = "0.1.0"
+description = "Manual multi-role review scenario powered by Codex App Server"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph",
+]
+
+[project.scripts]
+codex-otc-review = "codex_otc_review.runner:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.12.0",
+]
+
+[tool.uv.sources]
+langgraph = { path = "../libs/langgraph", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["codex_otc_review"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
