@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langgraph.prebuilt import CodexAppServerNode
 
-from codex_otc_review.config import ScenarioConfig
+from codex_otc_review.config import ScenarioConfig, parse_args, parse_config
 from codex_otc_review.prompts import (
     build_orchestrator_prompt,
     build_researcher_prompt,
@@ -144,3 +145,24 @@ class ScenarioRunner:
             "needs_more_research": bool(data.get("needs_more_research")),
             "blocking_gaps": list(data.get("blocking_gaps", [])),
         }
+
+
+def build_node(config: ScenarioConfig) -> CodexAppServerNode:
+    """Construct the real Codex App Server node for one run."""
+
+    return CodexAppServerNode(
+        cwd=str(config.project),
+        model=config.model,
+        approval_policy=config.approval_policy,
+        sandbox_policy=config.sandbox_policy,
+        client_info={"name": "codex-otc-review", "version": "0.1.0"},
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entrypoint for running the review scenario."""
+
+    config = parse_config(parse_args(list(argv) if argv is not None else None))
+    runner = ScenarioRunner(config=config, node=build_node(config))
+    runner.run()
+    return 0
