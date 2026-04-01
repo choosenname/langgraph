@@ -1,4 +1,4 @@
-"""Tests for the Codex app server prebuilt node scaffold."""
+"""Tests for the Codex app server prebuilt node."""
 
 import asyncio
 import threading
@@ -8,41 +8,147 @@ from inspect import signature
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+import langgraph.prebuilt.codex_app_server as codex_app_server_module
 from langgraph import prebuilt
 
 
-class _FakeTransport:
-    def __init__(self, events: list[object] | None = None) -> None:
+class _FakeJsonRpcTransport:
+    def __init__(
+        self,
+        responses: dict[str, list[object]] | None = None,
+        notifications: list[object] | None = None,
+    ) -> None:
         self.start_count = 0
-        self.requests: list[object] = []
-        self._events = list(events or [])
+        self.close_count = 0
+        self.request_calls: list[tuple[str, dict[str, object]]] = []
+        self.notify_calls: list[tuple[str, dict[str, object] | None]] = []
+        self._responses = {key: list(value) for key, value in (responses or {}).items()}
+        self._notifications = list(notifications or [])
 
     def start(self) -> None:
         self.start_count += 1
 
-    def send(self, request: object) -> None:
-        self.requests.append(request)
+    def request(self, method: str, params: dict[str, object]) -> object:
+        self.request_calls.append((method, params))
+        queue = self._responses.get(method)
+        if not queue:
+            raise AssertionError(f"no scripted response for {method}")
+        return queue.pop(0)
 
-    def recv(self) -> object:
-        if not self._events:
-            raise EOFError("no scripted events remaining")
-        return self._events.pop(0)
+    def notify(self, method: str, params: dict[str, object] | None = None) -> None:
+        self.notify_calls.append((method, params))
+
+    def recv_notification(self) -> object:
+        if not self._notifications:
+            raise EOFError("no scripted notifications remaining")
+        return self._notifications.pop(0)
+
+    def close(self) -> None:
+        self.close_count += 1
 
 
-class _BlockingTransport(_FakeTransport):
-    def __init__(self, events: list[object] | None = None) -> None:
-        super().__init__(events=events)
+class _BlockingJsonRpcTransport(_FakeJsonRpcTransport):
+    def __init__(
+        self,
+        responses: dict[str, list[object]] | None = None,
+        notifications: list[object] | None = None,
+    ) -> None:
+        super().__init__(responses=responses, notifications=notifications)
         self.release = threading.Event()
         self.waiting = threading.Event()
         self._waited = False
 
-    def recv(self) -> object:
+    def recv_notification(self) -> object:
         if not self._waited:
             self._waited = True
             self.waiting.set()
             if not self.release.wait(timeout=1):
                 raise AssertionError("transport was not released")
-        return super().recv()
+        return super().recv_notification()
+
+
+def _initialize_result() -> dict[str, object]:
+    return {"userAgent": "tests/1.0"}
+
+
+def _thread_start_result(thread_id: str = "thread-123") -> dict[str, object]:
+    return {
+        "thread": {"id": thread_id},
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "cwd": "/tmp/worktree",
+        "model": "gpt-5",
+        "modelProvider": "openai",
+        "sandbox": {"type": "workspaceWrite"},
+    }
+
+
+def _turn_start_result(turn_id: str = "turn-123") -> dict[str, object]:
+    return {"turn": {"id": turn_id, "status": "inProgress", "items": []}}
+
+
+def _turn_completed_notification(
+    *,
+    thread_id: str = "thread-123",
+    turn_id: str = "turn-123",
+    status: str = "completed",
+    error: dict[str, object] | None = None,
+) -> dict[str, object]:
+    turn: dict[str, object] = {"id": turn_id, "status": status, "items": []}
+    if error is not None:
+        turn["error"] = error
+    return {"method": "turn/completed", "params": {"threadId": thread_id, "turn": turn}}
+
+
+def _agent_message_delta_notification(
+    delta: str,
+    *,
+    thread_id: str = "thread-123",
+    turn_id: str = "turn-123",
+    item_id: str = "item-123",
+) -> dict[str, object]:
+    return {
+        "method": "item/agentMessage/delta",
+        "params": {
+            "delta": delta,
+            "itemId": item_id,
+            "threadId": thread_id,
+            "turnId": turn_id,
+        },
+    }
+
+
+def _agent_message_completed_notification(
+    text: str,
+    *,
+    thread_id: str = "thread-123",
+    turn_id: str = "turn-123",
+    item_id: str = "item-123",
+) -> dict[str, object]:
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {"id": item_id, "type": "agentMessage", "text": text},
+        },
+    }
+
+
+def _new_transport(
+    *,
+    thread_id: str = "thread-123",
+    turn_id: str = "turn-123",
+    notifications: list[object] | None = None,
+) -> _FakeJsonRpcTransport:
+    return _FakeJsonRpcTransport(
+        responses={
+            "initialize": [_initialize_result()],
+            "thread/start": [_thread_start_result(thread_id=thread_id)],
+            "turn/start": [_turn_start_result(turn_id=turn_id)],
+        },
+        notifications=notifications or [_turn_completed_notification()],
+    )
 
 
 def test_codex_app_server_node_is_exported() -> None:
@@ -89,48 +195,54 @@ def test_codex_app_server_node_lazy_starts_transport_on_first_invoke(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(
-        events=[{"type": "turn/completed"}, {"type": "turn/completed"}]
-    )
+    transport = _new_transport()
     factory_calls: list[object] = []
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         factory_calls.append(node)
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
 
     node = node_class(
-        command=["codex", "run"],
+        command=["codex", "app-server"],
         cwd="/tmp/worktree",
         model="gpt-5",
         approval_policy="on-request",
         sandbox_policy="workspace-write",
-        client_info={"name": "tests"},
+        client_info={"name": "tests", "version": "1.0"},
     )
 
     assert factory_calls == []
     assert transport.start_count == 0
-    assert transport.requests == []
+    assert transport.request_calls == []
+    assert transport.notify_calls == []
 
-    node.invoke({"messages": []})
+    node.invoke({"messages": [HumanMessage(content="hello")]})
 
     assert factory_calls == [node]
     assert transport.start_count == 1
-    assert transport.requests[0] == {
-        "type": "initialize",
-        "command": ["codex", "run"],
-        "cwd": "/tmp/worktree",
-        "model": "gpt-5",
-        "approval_policy": "on-request",
-        "sandbox_policy": "workspace-write",
-        "client_info": {"name": "tests"},
-        "messages_key": "messages",
-    }
-    assert [request["type"] for request in transport.requests[1:]] == [
+    assert transport.request_calls[0] == (
+        "initialize",
+        {"clientInfo": {"name": "tests", "version": "1.0"}},
+    )
+    assert transport.notify_calls == [("initialized", None)]
+    assert transport.request_calls[1] == (
         "thread/start",
+        {
+            "cwd": "/tmp/worktree",
+            "model": "gpt-5",
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+        },
+    )
+    assert transport.request_calls[2] == (
         "turn/start",
-    ]
+        {
+            "threadId": "thread-123",
+            "input": [{"type": "text", "text": "user: hello"}],
+        },
+    )
 
 
 def test_codex_app_server_node_initializes_once_and_reuses_thread(
@@ -139,42 +251,46 @@ def test_codex_app_server_node_initializes_once_and_reuses_thread(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(
-        events=[{"type": "turn/completed"}, {"type": "turn/completed"}]
+    transport = _FakeJsonRpcTransport(
+        responses={
+            "initialize": [_initialize_result()],
+            "thread/start": [_thread_start_result(thread_id="thread-123")],
+            "turn/start": [
+                _turn_start_result(turn_id="turn-1"),
+                _turn_start_result(turn_id="turn-2"),
+            ],
+        },
+        notifications=[
+            _turn_completed_notification(turn_id="turn-1"),
+            _turn_completed_notification(turn_id="turn-2"),
+        ],
     )
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
 
     node = node_class(
-        command=["codex", "run"],
+        command=["codex", "app-server"],
         cwd="/tmp/worktree",
         model="gpt-5",
         approval_policy="on-request",
         sandbox_policy="workspace-write",
-        client_info={"name": "tests"},
+        client_info={"name": "tests", "version": "1.0"},
     )
 
-    node.invoke({"messages": []})
-    node.invoke({"messages": []})
+    node.invoke({"messages": [HumanMessage(content="hello")]})
+    node.invoke({"messages": [HumanMessage(content="hello again")]})
 
-    request_types = [request["type"] for request in transport.requests]
+    request_methods = [method for method, _ in transport.request_calls]
 
-    assert request_types.count("initialize") == 1
-    assert request_types.count("thread/start") == 1
-    assert request_types.count("turn/start") == 2
-    assert transport.requests[0] == {
-        "type": "initialize",
-        "command": ["codex", "run"],
-        "cwd": "/tmp/worktree",
-        "model": "gpt-5",
-        "approval_policy": "on-request",
-        "sandbox_policy": "workspace-write",
-        "client_info": {"name": "tests"},
-        "messages_key": "messages",
-    }
+    assert request_methods.count("initialize") == 1
+    assert request_methods.count("thread/start") == 1
+    assert request_methods.count("turn/start") == 2
+    assert transport.notify_calls == [("initialized", None)]
+    assert transport.request_calls[2][1]["threadId"] == "thread-123"
+    assert transport.request_calls[3][1]["threadId"] == "thread-123"
 
 
 @pytest.mark.asyncio
@@ -184,15 +300,20 @@ async def test_codex_app_server_node_ainvoke_returns_ai_message(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _BlockingTransport(
-        events=[
-            {"type": "assistant/text_delta", "content": "Hel"},
-            {"type": "assistant/text_delta", "content": "lo"},
-            {"type": "turn/completed"},
-        ]
+    transport = _BlockingJsonRpcTransport(
+        responses={
+            "initialize": [_initialize_result()],
+            "thread/start": [_thread_start_result()],
+            "turn/start": [_turn_start_result()],
+        },
+        notifications=[
+            _agent_message_delta_notification("Hel"),
+            _agent_message_delta_notification("lo"),
+            _turn_completed_notification(),
+        ],
     )
 
-    def _factory(node: object) -> _BlockingTransport:
+    def _factory(node: object) -> _BlockingJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
@@ -224,17 +345,16 @@ def test_codex_app_server_node_retries_transport_startup_after_failure(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    class _FailingTransport(_FakeTransport):
+    class _FailingTransport(_FakeJsonRpcTransport):
         def start(self) -> None:
             super().start()
-            msg = "boom"
-            raise RuntimeError(msg)
+            raise RuntimeError("boom")
 
     first_transport = _FailingTransport()
-    second_transport = _FakeTransport(events=[{"type": "turn/completed"}])
+    second_transport = _new_transport()
     factory_calls: list[int] = []
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         factory_calls.append(len(factory_calls))
         return first_transport if len(factory_calls) == 1 else second_transport
 
@@ -242,19 +362,15 @@ def test_codex_app_server_node_retries_transport_startup_after_failure(
 
     node = node_class()
 
-    try:
-        node.invoke({"messages": []})
-    except RuntimeError as exc:
-        assert str(exc) == "boom"
-    else:  # pragma: no cover - defensive
-        raise AssertionError("expected startup failure")
+    with pytest.raises(RuntimeError, match="boom"):
+        node.invoke({"messages": [HumanMessage(content="hello")]})
 
-    node.invoke({"messages": []})
+    node.invoke({"messages": [HumanMessage(content="hello again")]})
 
     assert factory_calls == [0, 1]
     assert first_transport.start_count == 1
     assert second_transport.start_count == 1
-    assert [request["type"] for request in second_transport.requests] == [
+    assert [method for method, _ in second_transport.request_calls] == [
         "initialize",
         "thread/start",
         "turn/start",
@@ -267,19 +383,19 @@ def test_codex_app_server_node_restarts_transport_after_dead_transport(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    first_transport = _FakeTransport(
-        events=[{"type": "assistant/text_delta", "content": "Hel"}]
+    first_transport = _new_transport(
+        notifications=[_agent_message_delta_notification("Hel")]
     )
-    second_transport = _FakeTransport(
-        events=[
-            {"type": "assistant/text_delta", "content": "Hel"},
-            {"type": "assistant/text_delta", "content": "lo"},
-            {"type": "turn/completed"},
+    second_transport = _new_transport(
+        notifications=[
+            _agent_message_delta_notification("Hel"),
+            _agent_message_delta_notification("lo"),
+            _turn_completed_notification(),
         ]
     )
     factory_calls: list[int] = []
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         factory_calls.append(len(factory_calls))
         return first_transport if len(factory_calls) == 1 else second_transport
 
@@ -295,11 +411,6 @@ def test_codex_app_server_node_restarts_transport_after_dead_transport(
     assert factory_calls == [0, 1]
     assert first_transport.start_count == 1
     assert second_transport.start_count == 1
-    assert [request["type"] for request in second_transport.requests] == [
-        "initialize",
-        "thread/start",
-        "turn/start",
-    ]
     assert result == {"messages": [AIMessage(content="Hello")]}
 
 
@@ -309,25 +420,30 @@ def test_codex_app_server_node_resets_transport_after_raw_transport_exception(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    class _BrokenTransport(_FakeTransport):
-        def recv(self) -> object:
-            if not self._events:
+    class _BrokenTransport(_FakeJsonRpcTransport):
+        def recv_notification(self) -> object:
+            if not self._notifications:
                 raise RuntimeError("transport exploded")
-            return super().recv()
+            return super().recv_notification()
 
     first_transport = _BrokenTransport(
-        events=[{"type": "assistant/text_delta", "content": "Hel"}]
+        responses={
+            "initialize": [_initialize_result()],
+            "thread/start": [_thread_start_result()],
+            "turn/start": [_turn_start_result()],
+        },
+        notifications=[_agent_message_delta_notification("Hel")],
     )
-    second_transport = _FakeTransport(
-        events=[
-            {"type": "assistant/text_delta", "content": "Hel"},
-            {"type": "assistant/text_delta", "content": "lo"},
-            {"type": "turn/completed"},
+    second_transport = _new_transport(
+        notifications=[
+            _agent_message_delta_notification("Hel"),
+            _agent_message_delta_notification("lo"),
+            _turn_completed_notification(),
         ]
     )
     factory_calls: list[int] = []
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         factory_calls.append(len(factory_calls))
         return first_transport if len(factory_calls) == 1 else second_transport
 
@@ -352,27 +468,35 @@ def test_codex_app_server_node_serializes_overlapping_invocations(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    class _BlockingTransport(_FakeTransport):
+    class _OverlapTransport(_FakeJsonRpcTransport):
         def __init__(self) -> None:
             super().__init__(
-                events=[
-                    {"type": "turn/completed"},
-                    {"type": "turn/completed"},
-                ]
+                responses={
+                    "initialize": [_initialize_result()],
+                    "thread/start": [_thread_start_result()],
+                    "turn/start": [
+                        _turn_start_result(turn_id="turn-1"),
+                        _turn_start_result(turn_id="turn-2"),
+                    ],
+                },
+                notifications=[
+                    _turn_completed_notification(turn_id="turn-1"),
+                    _turn_completed_notification(turn_id="turn-2"),
+                ],
             )
             self.in_recv = threading.Event()
             self.release = threading.Event()
 
-        def recv(self) -> object:
+        def recv_notification(self) -> object:
             if not self.in_recv.is_set():
                 self.in_recv.set()
                 if not self.release.wait(timeout=1):
                     raise AssertionError("transport was not released")
-            return super().recv()
+            return super().recv_notification()
 
-    transport = _BlockingTransport()
+    transport = _OverlapTransport()
 
-    def _factory(node: object) -> _BlockingTransport:
+    def _factory(node: object) -> _OverlapTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
@@ -396,7 +520,7 @@ def test_codex_app_server_node_serializes_overlapping_invocations(
     second.start()
     time.sleep(0.05)
 
-    assert len(transport.requests) == 3
+    assert len(transport.request_calls) == 3
     assert second.is_alive()
 
     transport.release.set()
@@ -408,7 +532,7 @@ def test_codex_app_server_node_serializes_overlapping_invocations(
         {"messages": [AIMessage(content="")]},
         {"messages": [AIMessage(content="")]},
     ]
-    assert [request["type"] for request in transport.requests] == [
+    assert [method for method, _ in transport.request_calls] == [
         "initialize",
         "thread/start",
         "turn/start",
@@ -422,14 +546,14 @@ def test_codex_app_server_node_serializes_message_history_into_turn_start(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(
-        events=[
-            {"type": "assistant/text_delta", "content": "ok"},
-            {"type": "turn/completed"},
+    transport = _new_transport(
+        notifications=[
+            _agent_message_delta_notification("ok"),
+            _turn_completed_notification(),
         ]
     )
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
@@ -445,14 +569,18 @@ def test_codex_app_server_node_serializes_message_history_into_turn_start(
         }
     )
 
-    assert transport.requests[2] == {
-        "type": "turn/start",
-        "messages": [
-            {"role": "system", "content": "system context"},
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "hi there"},
-        ],
-    }
+    assert transport.request_calls[2] == (
+        "turn/start",
+        {
+            "threadId": "thread-123",
+            "input": [
+                {
+                    "type": "text",
+                    "text": "system: system context\n\nuser: hello\n\nassistant: hi there",
+                }
+            ],
+        },
+    )
 
 
 def test_codex_app_server_node_returns_ai_message_from_assistant_deltas(
@@ -461,15 +589,39 @@ def test_codex_app_server_node_returns_ai_message_from_assistant_deltas(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(
-        events=[
-            {"type": "assistant/text_delta", "content": "Hel"},
-            {"type": "assistant/text_delta", "content": "lo"},
-            {"type": "turn/completed"},
+    transport = _new_transport(
+        notifications=[
+            _agent_message_delta_notification("Hel"),
+            _agent_message_delta_notification("lo"),
+            _turn_completed_notification(),
         ]
     )
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
+        return transport
+
+    monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
+
+    node = node_class()
+    result = node.invoke({"messages": [HumanMessage(content="hello")]})
+
+    assert result == {"messages": [AIMessage(content="Hello")]}
+
+
+def test_codex_app_server_node_uses_completed_agent_message_without_deltas(
+    monkeypatch: object,
+) -> None:
+    node_class = getattr(prebuilt, "CodexAppServerNode", None)
+    assert node_class is not None
+
+    transport = _new_transport(
+        notifications=[
+            _agent_message_completed_notification("Hello"),
+            _turn_completed_notification(),
+        ]
+    )
+
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
@@ -486,10 +638,10 @@ def test_codex_app_server_node_validates_input_before_starting_transport(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport()
+    transport = _new_transport()
     factory_calls: list[object] = []
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         factory_calls.append(node)
         return transport
 
@@ -502,7 +654,7 @@ def test_codex_app_server_node_validates_input_before_starting_transport(
 
     assert factory_calls == []
     assert transport.start_count == 0
-    assert transport.requests == []
+    assert transport.request_calls == []
 
 
 def test_codex_app_server_node_raises_on_eof_before_completion(
@@ -511,13 +663,13 @@ def test_codex_app_server_node_raises_on_eof_before_completion(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(
-        events=[
-            {"type": "assistant/text_delta", "content": "Hel"},
+    transport = _new_transport(
+        notifications=[
+            _agent_message_delta_notification("Hel"),
         ]
     )
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
@@ -527,89 +679,122 @@ def test_codex_app_server_node_raises_on_eof_before_completion(
     with pytest.raises(prebuilt.CodexAppServerError, match="EOF"):
         node.invoke({"messages": [HumanMessage(content="hello")]})
 
-    assert transport.requests[0] == {
-        "type": "initialize",
-        "command": None,
-        "cwd": None,
-        "model": None,
-        "approval_policy": None,
-        "sandbox_policy": None,
-        "client_info": None,
-        "messages_key": "messages",
-    }
-    assert transport.requests[1] == {"type": "thread/start"}
-    assert transport.requests[2] == {
-        "type": "turn/start",
-        "messages": [{"role": "user", "content": "hello"}],
-    }
+    assert transport.request_calls[0] == (
+        "initialize",
+        {"clientInfo": {"name": "langgraph-prebuilt", "version": "0"}},
+    )
+    assert transport.request_calls[1] == ("thread/start", {})
+    assert transport.request_calls[2] == (
+        "turn/start",
+        {
+            "threadId": "thread-123",
+            "input": [{"type": "text", "text": "user: hello"}],
+        },
+    )
 
 
-def test_codex_app_server_node_raises_on_turn_error_event(
+def test_codex_app_server_node_raises_on_server_error_notification(
     monkeypatch: object,
 ) -> None:
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(
-        events=[
+    transport = _new_transport(
+        notifications=[
             {
-                "type": "turn/failed",
-                "message": "server rejected the turn",
+                "method": "error",
+                "params": {
+                    "threadId": "thread-123",
+                    "turnId": "turn-123",
+                    "willRetry": False,
+                    "error": {"message": "server rejected the turn"},
+                },
             }
         ]
     )
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
 
     node = node_class()
 
-    with pytest.raises(prebuilt.CodexAppServerError, match="turn failed"):
+    with pytest.raises(prebuilt.CodexAppServerError, match="server rejected the turn"):
         node.invoke({"messages": [HumanMessage(content="hello")]})
 
 
-def test_codex_app_server_node_raises_on_protocol_error_event(
+def test_codex_app_server_node_raises_on_failed_turn_status(
     monkeypatch: object,
 ) -> None:
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(
-        events=[
-            {
-                "type": "protocol/error",
-                "error": "bad handshake",
-            }
+    transport = _new_transport(
+        notifications=[
+            _turn_completed_notification(
+                status="failed",
+                error={"message": "server rejected the turn"},
+            )
         ]
     )
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
 
     node = node_class()
 
-    with pytest.raises(prebuilt.CodexAppServerError, match="turn failed"):
+    with pytest.raises(prebuilt.CodexAppServerError, match="server rejected the turn"):
         node.invoke({"messages": [HumanMessage(content="hello")]})
 
 
-def test_codex_app_server_node_raises_on_invalid_turn_state(
+def test_codex_app_server_node_raises_on_invalid_notification(
     monkeypatch: object,
 ) -> None:
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport(events=[["not", "an", "event"]])
+    transport = _new_transport(notifications=[["not", "a", "notification"]])
 
-    def _factory(node: object) -> _FakeTransport:
+    def _factory(node: object) -> _FakeJsonRpcTransport:
         return transport
 
     monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
 
     node = node_class()
 
-    with pytest.raises(prebuilt.CodexAppServerError, match="Invalid event"):
+    with pytest.raises(prebuilt.CodexAppServerError, match="Invalid notification"):
         node.invoke({"messages": [HumanMessage(content="hello")]})
+
+
+def test_codex_app_server_node_close_closes_transport(monkeypatch: object) -> None:
+    node_class = getattr(prebuilt, "CodexAppServerNode", None)
+    assert node_class is not None
+
+    transport = _new_transport()
+
+    def _factory(node: object) -> _FakeJsonRpcTransport:
+        return transport
+
+    monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
+
+    node = node_class()
+    node.invoke({"messages": [HumanMessage(content="hello")]})
+
+    node.close()
+
+    assert transport.close_count == 1
+
+
+def test_default_transport_factory_builds_stdio_transport() -> None:
+    node = prebuilt.CodexAppServerNode(
+        command=["codex", "app-server"], cwd="/tmp/worktree"
+    )
+
+    transport = node._default_transport_factory(node)
+
+    assert isinstance(transport, codex_app_server_module._StdioJsonRpcTransport)
+    assert transport.command == ("codex", "app-server")
+    assert transport.cwd == "/tmp/worktree"
