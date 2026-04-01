@@ -2,19 +2,28 @@
 
 from inspect import signature
 
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
 from langgraph import prebuilt
 
 
 class _FakeTransport:
-    def __init__(self) -> None:
+    def __init__(self, events: list[object] | None = None) -> None:
         self.start_count = 0
         self.requests: list[object] = []
+        self._events = list(events or [])
 
     def start(self) -> None:
         self.start_count += 1
 
     def send(self, request: object) -> None:
         self.requests.append(request)
+
+    def recv(self) -> object:
+        if not self._events:
+            raise EOFError("no scripted events remaining")
+        return self._events.pop(0)
 
 
 def test_codex_app_server_node_is_exported() -> None:
@@ -61,7 +70,9 @@ def test_codex_app_server_node_lazy_starts_transport_on_first_invoke(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport()
+    transport = _FakeTransport(
+        events=[{"type": "turn/completed"}, {"type": "turn/completed"}]
+    )
     factory_calls: list[object] = []
 
     def _factory(node: object) -> _FakeTransport:
@@ -109,7 +120,9 @@ def test_codex_app_server_node_initializes_once_and_reuses_thread(
     node_class = getattr(prebuilt, "CodexAppServerNode", None)
     assert node_class is not None
 
-    transport = _FakeTransport()
+    transport = _FakeTransport(
+        events=[{"type": "turn/completed"}, {"type": "turn/completed"}]
+    )
 
     def _factory(node: object) -> _FakeTransport:
         return transport
@@ -158,7 +171,7 @@ def test_codex_app_server_node_retries_transport_startup_after_failure(
             raise RuntimeError(msg)
 
     first_transport = _FailingTransport()
-    second_transport = _FakeTransport()
+    second_transport = _FakeTransport(events=[{"type": "turn/completed"}])
     factory_calls: list[int] = []
 
     def _factory(node: object) -> _FakeTransport:
@@ -186,3 +199,122 @@ def test_codex_app_server_node_retries_transport_startup_after_failure(
         "thread/start",
         "turn/start",
     ]
+
+
+def test_codex_app_server_node_serializes_message_history_into_turn_start(
+    monkeypatch: object,
+) -> None:
+    node_class = getattr(prebuilt, "CodexAppServerNode", None)
+    assert node_class is not None
+
+    transport = _FakeTransport(
+        events=[
+            {"type": "assistant/text_delta", "content": "ok"},
+            {"type": "turn/completed"},
+        ]
+    )
+
+    def _factory(node: object) -> _FakeTransport:
+        return transport
+
+    monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
+
+    node = node_class()
+    node.invoke(
+        {
+            "messages": [
+                SystemMessage(content="system context"),
+                HumanMessage(content="hello"),
+                AIMessage(content="hi there"),
+            ]
+        }
+    )
+
+    assert transport.requests[2] == {
+        "type": "turn/start",
+        "messages": [
+            {"role": "system", "content": "system context"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ],
+    }
+
+
+def test_codex_app_server_node_returns_ai_message_from_assistant_deltas(
+    monkeypatch: object,
+) -> None:
+    node_class = getattr(prebuilt, "CodexAppServerNode", None)
+    assert node_class is not None
+
+    transport = _FakeTransport(
+        events=[
+            {"type": "assistant/text_delta", "content": "Hel"},
+            {"type": "assistant/text_delta", "content": "lo"},
+            {"type": "turn/completed"},
+        ]
+    )
+
+    def _factory(node: object) -> _FakeTransport:
+        return transport
+
+    monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
+
+    node = node_class()
+    result = node.invoke({"messages": [HumanMessage(content="hello")]})
+
+    assert result == {"messages": [AIMessage(content="Hello")]}
+
+
+def test_codex_app_server_node_validates_input_before_starting_transport(
+    monkeypatch: object,
+) -> None:
+    node_class = getattr(prebuilt, "CodexAppServerNode", None)
+    assert node_class is not None
+
+    transport = _FakeTransport()
+    factory_calls: list[object] = []
+
+    def _factory(node: object) -> _FakeTransport:
+        factory_calls.append(node)
+        return transport
+
+    monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
+
+    node = node_class()
+
+    with pytest.raises(ValueError, match="Codex app server input must be a dict"):
+        node.invoke([])
+
+    assert factory_calls == []
+    assert transport.start_count == 0
+    assert transport.requests == []
+
+
+def test_codex_app_server_node_raises_on_eof_before_completion(
+    monkeypatch: object,
+) -> None:
+    node_class = getattr(prebuilt, "CodexAppServerNode", None)
+    assert node_class is not None
+
+    transport = _FakeTransport(
+        events=[
+            {"type": "assistant/text_delta", "content": "Hel"},
+        ]
+    )
+
+    def _factory(node: object) -> _FakeTransport:
+        return transport
+
+    monkeypatch.setattr(node_class, "_transport_factory", _factory, raising=False)
+
+    node = node_class()
+
+    with pytest.raises(prebuilt.CodexAppServerError, match="EOF"):
+        node.invoke({"messages": [HumanMessage(content="hello")]})
+
+    assert transport.requests[0] == {"type": "initialize", "command": None, "cwd": None, "model": None, "approval_policy": None, "sandbox_policy": None, "client_info": None, "messages_key": "messages"}
+    assert transport.requests[1] == {"type": "thread/start"}
+    assert transport.requests[2] == {
+        "type": "turn/start",
+        "messages": [{"role": "user", "content": "hello"}],
+    }

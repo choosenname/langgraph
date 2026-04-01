@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Callable
 
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, convert_to_messages
 from langchain_core.runnables.config import RunnableConfig
 
 from langgraph._internal._runnable import RunnableCallable
@@ -63,7 +64,62 @@ class CodexAppServerNode(RunnableCallable):
             raise CodexAppServerError("Codex app server transport is missing send().")
         send(request)
 
+    def _get_messages(self, input: Any) -> list[BaseMessage]:  # noqa: A002
+        if not isinstance(input, dict):
+            raise ValueError("Codex app server input must be a dict.")
+        if self.messages_key not in input:
+            raise ValueError(f"Missing messages key '{self.messages_key}'.")
+
+        messages = convert_to_messages(input[self.messages_key])
+        return list(messages)
+
+    @staticmethod
+    def _serialize_message(message: BaseMessage) -> dict[str, Any]:
+        if isinstance(message, SystemMessage):
+            role = "system"
+        elif isinstance(message, HumanMessage):
+            role = "user"
+        elif isinstance(message, AIMessage):
+            role = "assistant"
+        else:
+            raise ValueError(f"Unsupported message type: {type(message).__name__}")
+
+        return {"role": role, "content": message.content}
+
+    def _serialize_messages(self, messages: list[BaseMessage]) -> list[dict[str, Any]]:
+        return [self._serialize_message(message) for message in messages]
+
+    def _receive_event(self) -> Any:
+        transport = self._ensure_transport()
+        receive = getattr(transport, "recv", None)
+        if receive is None:
+            raise CodexAppServerError("Codex app server transport is missing recv().")
+        try:
+            return receive()
+        except EOFError:
+            raise CodexAppServerError("Unexpected EOF from Codex app server transport.")
+
+    def _assemble_assistant_message(self) -> AIMessage:
+        fragments: list[str] = []
+
+        while True:
+            event = self._receive_event()
+            if not isinstance(event, dict):
+                continue
+
+            event_type = event.get("type")
+            if event_type == "assistant/text_delta":
+                fragment = event.get("content")
+                if fragment is not None:
+                    fragments.append(str(fragment))
+                continue
+
+            if event_type == "turn/completed":
+                return AIMessage(content="".join(fragments))
+
     def _func(self, input: Any, config: RunnableConfig) -> Any:  # noqa: A002
+        messages = self._get_messages(input)
+
         if not self._initialized:
             self._send_request(
                 {
@@ -83,8 +139,13 @@ class CodexAppServerNode(RunnableCallable):
             self._send_request({"type": "thread/start"})
             self._thread_started = True
 
-        self._send_request({"type": "turn/start"})
-        return input
+        self._send_request(
+            {
+                "type": "turn/start",
+                "messages": self._serialize_messages(messages),
+            }
+        )
+        return {"messages": [self._assemble_assistant_message()]}
 
 
 __all__ = ["CodexAppServerError", "CodexAppServerNode"]
